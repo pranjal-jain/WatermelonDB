@@ -22,6 +22,9 @@
   "homepage": "https://github.com/Nozbe/WatermelonDB#readme",
   "bugs": "https://github.com/Nozbe/WatermelonDB/issues",
   "license": "MIT",
+  "engines": {
+    "node": ">=8.3"
+  },
   "keywords": [
     "database",
     "indexeddb",
