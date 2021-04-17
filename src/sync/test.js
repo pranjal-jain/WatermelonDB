@@ -3,9 +3,10 @@ import { change, times, map, length } from 'rambdax'
 import { skip as skip$ } from 'rxjs/operators'
 import { noop } from '../utils/fp'
 import { randomId } from '../utils/common'
-import { mockDatabase } from '../__tests__/testModels'
+import { mockDatabase, testSchema } from '../__tests__/testModels'
 import { expectToRejectWithMessage } from '../__tests__/utils'
 import { sanitizedRaw } from '../RawRecord'
+import { schemaMigrations, createTable, addColumns } from '../Schema/migrations'
 
 import { synchronize, hasUnsyncedChanges } from './index'
 import {
@@ -13,6 +14,9 @@ import {
   markLocalChangesAsSynced,
   applyRemoteChanges,
   getLastPulledAt,
+  getLastPulledSchemaVersion,
+  setLastPulledAt,
+  setLastPulledSchemaVersion,
 } from './impl'
 import { resolveConflict, isChangeSetEmpty } from './impl/helpers'
 
@@ -69,11 +73,24 @@ const emptyLocalChanges = Object.freeze({ changes: emptyChangeSet, affectedRecor
 const makeChangeSet = set => change(emptyChangeSet, '', set)
 const testApplyRemoteChanges = (db, set) => applyRemoteChanges(db, makeChangeSet(set))
 
+const sorted = models => {
+  const copy = models.slice()
+  copy.sort((a, b) => {
+    if (a.id < b.id) {
+      return -1
+    } else if (a.id > b.id) {
+      return 1
+    }
+    return 0
+  })
+  return copy
+}
+
 const makeLocalChanges = database =>
   database.action(async () => {
-    const projects = database.collections.get('mock_projects')
-    const tasks = database.collections.get('mock_tasks')
-    const comments = database.collections.get('mock_comments')
+    const projects = database.get('mock_projects')
+    const tasks = database.get('mock_tasks')
+    const comments = database.get('mock_comments')
 
     // create records
     const created = obj => ({ _status: 'created', ...obj })
@@ -155,7 +172,7 @@ describe('fetchLocalChanges', () => {
     expect(tDeleted._raw._status).toBe('deleted')
     const expectedChanges = clone({
       mock_projects: {
-        created: [pCreated1._raw, pCreated2._raw],
+        created: [pCreated2._raw, pCreated1._raw],
         updated: [pUpdated._raw],
         deleted: ['pDeleted'],
       },
@@ -167,8 +184,8 @@ describe('fetchLocalChanges', () => {
       },
     })
     const expectedAffectedRecords = [
-      pCreated1,
       pCreated2,
+      pCreated1,
       pUpdated,
       tCreated,
       tUpdated,
@@ -180,7 +197,7 @@ describe('fetchLocalChanges', () => {
     expect(result.affectedRecords).toEqual(expectedAffectedRecords)
 
     // simulate reload
-    database = cloneDatabase()
+    database = await cloneDatabase()
     const result2 = await fetchLocalChanges(database)
     expect(result2.changes).toEqual(expectedChanges)
     expect(result2.affectedRecords.map(r => r._raw)).toEqual(
@@ -217,7 +234,7 @@ describe('hasUnsyncedChanges', () => {
   })
   it('just one update is enough', async () => {
     const { database } = makeDatabase()
-    const collection = database.collections.get('mock_comments')
+    const collection = database.get('mock_comments')
     const record = await database.action(() =>
       collection.create(rec => {
         rec._raw._status = 'synced'
@@ -236,7 +253,7 @@ describe('hasUnsyncedChanges', () => {
   })
   it('just one delete is enough', async () => {
     const { database } = makeDatabase()
-    const collection = database.collections.get('mock_comments')
+    const collection = database.get('mock_comments')
     const record = await database.action(() =>
       collection.create(rec => {
         rec._raw._status = 'synced'
@@ -385,7 +402,9 @@ describe('markLocalChangesAsSynced', () => {
       mock_tasks: { created: [tCreated._raw], updated: [tUpdated._raw], deleted: ['tSynced'] },
       mock_comments: { created: [], updated: [], deleted: ['cUpdated', 'cCreated'] },
     })
-    expect(localChanges2.affectedRecords).toEqual([pSynced, newProject, tCreated, tUpdated])
+    expect(sorted(localChanges2.affectedRecords)).toEqual(
+      sorted([newProject, tCreated, pSynced, tUpdated]),
+    )
 
     await expectSyncedAndMatches(tasks, 'tUpdated', {
       _status: 'updated',
@@ -624,6 +643,12 @@ describe('applyRemoteChanges', () => {
 
     expect(await fetchLocalChanges(database)).toEqual(emptyLocalChanges)
   })
+  it(`safely skips collections that don't exist`, async () => {
+    const { database } = makeDatabase()
+
+    await testApplyRemoteChanges(database, { invalid_project: { created: [{ id: 'foo' }] } })
+    await testApplyRemoteChanges(database, { __proto__: { created: [{ id: 'foo' }] } }) // oof, naughty
+  })
 })
 
 const observeDatabase = database => {
@@ -650,7 +675,11 @@ describe('synchronize', () => {
 
     expect(observer).toHaveBeenCalledTimes(0)
     expect(pullChanges).toHaveBeenCalledTimes(1)
-    expect(pullChanges).toHaveBeenCalledWith({ lastPulledAt: null })
+    expect(pullChanges).toHaveBeenCalledWith({
+      lastPulledAt: null,
+      schemaVersion: 1,
+      migration: null,
+    })
   })
   it(`doesn't push changes if nothing to push`, async () => {
     const { database } = makeDatabase()
@@ -666,20 +695,45 @@ describe('synchronize', () => {
     const log = {}
     await synchronize({
       database,
-      pullChanges: jest.fn(emptyPull()),
-      // ensure we take more than 1ms for the log test
-      pushChanges: () => new Promise(resolve => setTimeout(resolve, 10)),
+      pullChanges: async () => {
+        // ensure we take more than 1ms for the log test
+        await new Promise(resolve => setTimeout(resolve, 10))
+        return emptyPull()()
+      },
+      pushChanges: () => {},
       log,
     })
 
     expect(log.startedAt).toBeInstanceOf(Date)
     expect(log.finishedAt).toBeInstanceOf(Date)
     expect(log.finishedAt.getTime()).toBeGreaterThan(log.startedAt.getTime())
+    expect(log.phase).toBe('done')
 
     expect(log.lastPulledAt).toBe(null)
     expect(log.newLastPulledAt).toBe(1500)
-  })
 
+    expect(log.error).toBe(undefined)
+
+    expect(log.remoteChangeCount).toBe(0)
+    expect(log.localChangeCount).toBe(0)
+  })
+  it('will not push changes if no `pushChanges`', async () => {
+    const { database } = makeDatabase()
+
+    await makeLocalChanges(database)
+
+    const pullChanges = async () => {
+      // ensure we take more than 1ms for the log test
+      await new Promise(resolve => setTimeout(resolve, 10))
+      return emptyPull()()
+    }
+    const log = {}
+    await synchronize({ database, pullChanges, log })
+    expect(log.startedAt).toBeInstanceOf(Date)
+    expect(log.finishedAt).toBeInstanceOf(Date)
+    expect(log.finishedAt.getTime()).toBeGreaterThan(log.startedAt.getTime())
+    expect(log.phase).toBe('done')
+  })
   it('can push changes', async () => {
     const { database } = makeDatabase()
 
@@ -688,10 +742,12 @@ describe('synchronize', () => {
 
     const pullChanges = jest.fn(emptyPull())
     const pushChanges = jest.fn()
-    await synchronize({ database, pullChanges, pushChanges })
+    const log = {}
+    await synchronize({ database, pullChanges, pushChanges, log })
 
     expect(pushChanges).toHaveBeenCalledWith({ changes: localChanges.changes, lastPulledAt: 1500 })
     expect(await fetchLocalChanges(database)).toEqual(emptyLocalChanges)
+    expect(log.localChangeCount).toBe(10)
   })
   it('can pull changes', async () => {
     const { database, projects, tasks } = makeDatabase()
@@ -711,7 +767,11 @@ describe('synchronize', () => {
 
     await synchronize({ database, pullChanges, pushChanges: jest.fn() })
 
-    expect(pullChanges).toHaveBeenCalledWith({ lastPulledAt: null })
+    expect(pullChanges).toHaveBeenCalledWith({
+      lastPulledAt: null,
+      schemaVersion: 1,
+      migration: null,
+    })
 
     expect(await fetchLocalChanges(database)).toEqual(emptyLocalChanges)
     await expectSyncedAndMatches(projects, 'new_project', { name: 'remote' })
@@ -785,6 +845,7 @@ describe('synchronize', () => {
     expect(await fetchLocalChanges(database)).toEqual(emptyLocalChanges)
 
     // check that log is good
+    expect(log.remoteChangeCount).toBe(7)
     expect(log.resolvedConflicts).toEqual([
       {
         local: tUpdatedInitial,
@@ -798,25 +859,108 @@ describe('synchronize', () => {
       },
     ])
   })
+  it(`allows conflict resolution to be customized`, async () => {
+    const { database, projects, tasks } = makeDatabase()
+
+    await database.action(async () => {
+      await database.batch(
+        prepareCreateFromRaw(projects, { id: 'p1', _status: 'synced', name: 'local' }),
+        prepareCreateFromRaw(projects, { id: 'p2', _status: 'created', name: 'local' }),
+        prepareCreateFromRaw(tasks, { id: 't1', _status: 'synced' }),
+        prepareCreateFromRaw(tasks, { id: 't2', _status: 'created' }),
+        prepareCreateFromRaw(tasks, {
+          id: 't3',
+          _status: 'updated',
+          name: 'local',
+          _changd: 'name',
+        }),
+      )
+    })
+
+    const conflictResolver = jest.fn((table, local, remote, resolved) => {
+      if (table === 'mock_tasks') {
+        resolved.name = 'GOTCHA'
+      }
+      return resolved
+    })
+
+    const pullChanges = async () => ({
+      changes: makeChangeSet({
+        mock_projects: {
+          created: [{ id: 'p2', name: 'remote' }], // error - update, stay synced
+          updated: [{ id: 'p1', name: 'change' }], // update
+        },
+        mock_tasks: {
+          updated: [
+            { id: 't1', name: 'remote' }, // update
+            { id: 't3', name: 'remote' }, // conflict
+          ],
+        },
+      }),
+      timestamp: 1500,
+    })
+    await synchronize({ database, pullChanges, pushChanges: jest.fn(), conflictResolver })
+
+    expect(conflictResolver).toHaveBeenCalledTimes(4)
+    expect(conflictResolver.mock.calls[0]).toMatchObject([
+      'mock_projects',
+      { id: 'p2', _status: 'created', name: 'local' },
+      { name: 'remote' },
+      { name: 'remote' },
+    ])
+    expect(conflictResolver.mock.calls[1]).toMatchObject([
+      'mock_projects',
+      { id: 'p1', _status: 'synced' },
+      { name: 'change' },
+      { _status: 'synced' },
+    ])
+    expect(conflictResolver.mock.results[1].value).toBe(conflictResolver.mock.calls[1][3])
+    expect(conflictResolver.mock.calls[2]).toMatchObject([
+      'mock_tasks',
+      { id: 't1', _status: 'synced', name: '' },
+      { name: 'remote' },
+      { name: 'GOTCHA' }, // we're mutating this arg in function, that's why
+    ])
+
+    await expectSyncedAndMatches(tasks, 't1', { name: 'GOTCHA' })
+    await expectSyncedAndMatches(tasks, 't3', { name: 'GOTCHA' })
+
+    expect(await fetchLocalChanges(database)).toEqual(emptyLocalChanges)
+  })
   it('remembers last_synced_at timestamp', async () => {
     const { database } = makeDatabase()
 
     let pullChanges = jest.fn(emptyPull(1500))
     await synchronize({ database, pullChanges, pushChanges: jest.fn() })
 
-    expect(pullChanges).toHaveBeenCalledWith({ lastPulledAt: null })
+    expect(pullChanges).toHaveBeenCalledWith({
+      lastPulledAt: null,
+      schemaVersion: 1,
+      migration: null,
+    })
 
     pullChanges = jest.fn(emptyPull(2500))
     const log = {}
     await synchronize({ database, pullChanges, pushChanges: jest.fn(), log })
 
     expect(pullChanges).toHaveBeenCalledTimes(1)
-    expect(pullChanges).toHaveBeenCalledWith({ lastPulledAt: 1500 })
+    expect(pullChanges).toHaveBeenCalledWith({
+      lastPulledAt: 1500,
+      schemaVersion: 1,
+      migration: null,
+    })
     expect(await getLastPulledAt(database)).toBe(2500)
     expect(log.lastPulledAt).toBe(1500)
     expect(log.newLastPulledAt).toBe(2500)
     // check underlying database since it's an implicit API
     expect(await database.adapter.getLocal('__watermelon_last_pulled_at')).toBe('2500')
+  })
+  it(`validates timestamp returned from pullChanges`, async () => {
+    const { database } = makeDatabase()
+    await expectToRejectWithMessage(
+      synchronize({ database, pullChanges: jest.fn(emptyPull(0)), pushChanges: jest.fn() }),
+      /pullChanges\(\) returned invalid timestamp/,
+    )
   })
   it('prevents concurrent syncs', async () => {
     const { database } = makeDatabase()
@@ -842,15 +986,19 @@ describe('synchronize', () => {
     await makeLocalChanges(database)
 
     const observer = observeDatabase(database)
-    const pullChanges = jest.fn(() => Promise.reject(new Error('pull-fail')))
+    const error = new Error('pull-fail')
+    const pullChanges = jest.fn(() => Promise.reject(error))
     const pushChanges = jest.fn()
-    const sync = await synchronize({ database, pullChanges, pushChanges }).catch(e => e)
+    const log = {}
+    const sync = await synchronize({ database, pullChanges, pushChanges, log }).catch(e => e)
 
     expect(observer).toHaveBeenCalledTimes(0)
     expect(pullChanges).toHaveBeenCalledTimes(1)
     expect(pushChanges).toHaveBeenCalledTimes(0)
     expect(sync).toMatchObject({ message: 'pull-fail' })
     expect(await getLastPulledAt(database)).toBe(null)
+    expect(log.phase).toBe('ready to pull')
+    expect(log.error).toBe(error)
   })
   it('can recover from push failure', async () => {
     const { database, projects } = makeDatabase()
@@ -951,7 +1099,11 @@ describe('synchronize', () => {
     const pushedChanges = pushChanges.mock.calls[0][0].changes
     expect(pushedChanges).not.toEqual(localChanges.changes)
     const expectedPushedChanges = clone(localChanges.changes)
-    expectedPushedChanges.mock_projects.created.push(project1, project2)
+    expectedPushedChanges.mock_projects.created = [
+      project2,
+      project1,
+      ...expectedPushedChanges.mock_projects.created,
+    ]
     expect(pushedChanges).toEqual(expectedPushedChanges)
 
     // Expect project3 to still need pushing
@@ -1084,5 +1236,181 @@ describe('synchronize', () => {
       synchronize({ database, pullChanges: jest.fn(), pushChanges: jest.fn() }),
       /actions must be enabled/i,
     )
+  })
+  describe('migration syncs', () => {
+    const testSchema10 = { ...testSchema, version: 10 }
+    const migrations = schemaMigrations({
+      migrations: [
+        {
+          toVersion: 10,
+          steps: [
+            addColumns({
+              table: 'attachment_versions',
+              columns: [{ name: 'reactions', type: 'string' }],
+            }),
+          ],
+        },
+        {
+          toVersion: 9,
+          steps: [
+            createTable({
+              name: 'attachments',
+              columns: [{ name: 'parent_id', type: 'string', isIndexed: true }],
+            }),
+          ],
+        },
+        { toVersion: 8, steps: [] },
+      ],
+    })
+    it(`remembers synced schema version on first sync`, async () => {
+      const { database } = mockDatabase({ actionsEnabled: true, schema: testSchema10, migrations })
+      const pullChanges = jest.fn(emptyPull())
+
+      await synchronize({
+        database,
+        pullChanges,
+        pushChanges: jest.fn(),
+        migrationsEnabledAtVersion: 7,
+      })
+      expect(pullChanges).toHaveBeenCalledWith({
+        lastPulledAt: null,
+        schemaVersion: 10,
+        migration: null,
+      })
+      expect(await getLastPulledSchemaVersion(database)).toBe(10)
+      // check underlying database since it's an implicit API
+      expect(await database.adapter.getLocal('__watermelon_last_pulled_schema_version')).toBe('10')
+    })
+    it(`remembers synced schema version on first sync, even if migrations are not enabled`, async () => {
+      const { database } = mockDatabase({ actionsEnabled: true, schema: testSchema10 })
+      const pullChanges = jest.fn(emptyPull())
+
+      await synchronize({ database, pullChanges, pushChanges: jest.fn() })
+      expect(pullChanges).toHaveBeenCalledWith({
+        lastPulledAt: null,
+        schemaVersion: 10,
+        migration: null,
+      })
+      expect(await getLastPulledSchemaVersion(database)).toBe(10)
+    })
+    it(`does not remember schema version if migration syncs are not enabled`, async () => {
+      const { database } = mockDatabase({ actionsEnabled: true, schema: testSchema10 })
+      await setLastPulledAt(database, 100)
+      const pullChanges = jest.fn(emptyPull())
+
+      await synchronize({ database, pullChanges, pushChanges: jest.fn() })
+      expect(pullChanges).toHaveBeenCalledWith({
+        lastPulledAt: 100,
+        schemaVersion: 10,
+        migration: null,
+      })
+      expect(await getLastPulledSchemaVersion(database)).toBe(null)
+    })
+    it(`performs no migration if up to date`, async () => {
+      const { database } = mockDatabase({ actionsEnabled: true, schema: testSchema10, migrations })
+      await setLastPulledAt(database, 1500)
+      await setLastPulledSchemaVersion(database, 10)
+
+      const pullChanges = jest.fn(emptyPull(2500))
+      await synchronize({
+        database,
+        pullChanges,
+        pushChanges: jest.fn(),
+        migrationsEnabledAtVersion: 7,
+      })
+      expect(pullChanges).toHaveBeenCalledWith({
+        lastPulledAt: 1500,
+        schemaVersion: 10,
+        migration: null,
+      })
+      expect(await getLastPulledSchemaVersion(database)).toBe(10)
+    })
+    it(`performs migration sync on schema version bump`, async () => {
+      const { database } = mockDatabase({ actionsEnabled: true, schema: testSchema10, migrations })
+      await setLastPulledAt(database, 1500)
+      await setLastPulledSchemaVersion(database, 9)
+
+      const pullChanges = jest.fn(emptyPull(2500))
+      await synchronize({
+        database,
+        pullChanges,
+        pushChanges: jest.fn(),
+        migrationsEnabledAtVersion: 7,
+      })
+      expect(pullChanges).toHaveBeenCalledWith({
+        lastPulledAt: 1500,
+        schemaVersion: 10,
+        migration: {
+          from: 9,
+          tables: [],
+          columns: [{ table: 'attachment_versions', columns: ['reactions'] }],
+        },
+      })
+      expect(await getLastPulledSchemaVersion(database)).toBe(10)
+    })
+    it(`performs fallback migration sync`, async () => {
+      const { database } = mockDatabase({ actionsEnabled: true, schema: testSchema10, migrations })
+      await setLastPulledAt(database, 1500)
+
+      const pullChanges = jest.fn(emptyPull(2500))
+      await synchronize({
+        database,
+        pullChanges,
+        pushChanges: jest.fn(),
+        migrationsEnabledAtVersion: 8,
+      })
+      expect(pullChanges).toHaveBeenCalledWith({
+        lastPulledAt: 1500,
+        schemaVersion: 10,
+        migration: {
+          from: 8,
+          tables: ['attachments'],
+          columns: [{ table: 'attachment_versions', columns: ['reactions'] }],
+        },
+      })
+      expect(await getLastPulledSchemaVersion(database)).toBe(10)
+    })
+    it(`does not remember schema version if pull fails`, async () => {
+      const { database } = mockDatabase({ actionsEnabled: true, schema: testSchema10, migrations })
+      await synchronize({
+        database,
+        pullChanges: jest.fn(() => Promise.reject(new Error('pull-fail'))),
+        pushChanges: jest.fn(),
+        migrationsEnabledAtVersion: 8,
+      }).catch(e => e)
+      expect(await getLastPulledSchemaVersion(database)).toBe(null)
+    })
+    it(`fails on programmer errors`, async () => {
+      const { database } = mockDatabase({ actionsEnabled: true, schema: testSchema10, migrations })
+
+      await expectToRejectWithMessage(
+        synchronize({ database, migrationsEnabledAtVersion: '9' }),
+        'Invalid migrationsEnabledAtVersion',
+      )
+      await expectToRejectWithMessage(
+        synchronize({ database, migrationsEnabledAtVersion: 11 }),
+        /migrationsEnabledAtVersion must not be greater than current schema version/,
+      )
+      await expectToRejectWithMessage(
+        synchronize({
+          database: mockDatabase({ actionsEnabled: true, schema: testSchema10 }).db,
+          migrationsEnabledAtVersion: 9,
+        }),
+        'Migration syncs cannot be enabled on a database that does not support migrations',
+      )
+      await expectToRejectWithMessage(
+        synchronize({ database, migrationsEnabledAtVersion: 6 }),
+        `migrationsEnabledAtVersion is too low - not possible to migrate from schema version 6`,
+      )
+    })
+    it(`fails on last synced schema version > current schema version`, async () => {
+      const { database } = mockDatabase({ actionsEnabled: true, schema: testSchema10, migrations })
+      await setLastPulledAt(database, 1500)
+      await setLastPulledSchemaVersion(database, 11)
+      await expectToRejectWithMessage(
+        synchronize({ database, migrationsEnabledAtVersion: 10 }),
+        /Last synced schema version \(11\) is greater than current schema version \(10\)/,
+      )
+    })
   })
 })

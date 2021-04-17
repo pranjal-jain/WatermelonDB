@@ -1,11 +1,10 @@
 // @flow
 
-import { Observable } from 'rxjs/Observable'
-import { prepend } from 'rambdax'
-
 import allPromises from '../utils/fp/allPromises'
+import { Observable } from '../utils/rx'
 import { toPromise } from '../utils/fp/Result'
 import { type Unsubscribe, SharedSubscribable } from '../utils/subscriptions'
+import { logger } from '../utils/common'
 
 // TODO: ?
 import lazy from '../decorators/lazy' // import from decorarators break the app on web production WTF ¯\_(ツ)_/¯
@@ -14,23 +13,38 @@ import subscribeToCount from '../observation/subscribeToCount'
 import subscribeToQuery from '../observation/subscribeToQuery'
 import subscribeToQueryWithColumns from '../observation/subscribeToQueryWithColumns'
 import subscribeToQueryWithSelect from '../observation/subscribeToQueryWithSelect'
-import { experimentalSelect, buildQueryDescription, queryWithoutDeleted, getSelectedColumns } from '../QueryDescription'
-import type { Condition, QueryDescription } from '../QueryDescription'
+import * as Q from '../QueryDescription'
+import type { Clause, QueryDescription } from '../QueryDescription'
 import type Model, { AssociationInfo } from '../Model'
 import type Collection from '../Collection'
 import type { TableName, ColumnName } from '../Schema'
 import type { RecordState } from '../RawRecord'
 
-import { getSecondaryTables, getAssociations } from './helpers'
+import { getAssociations } from './helpers'
 
-export type AssociationArgs = [TableName<any>, AssociationInfo]
+export type QueryAssociation = $Exact<{
+  from: TableName<any>,
+  to: TableName<any>,
+  info: AssociationInfo,
+}>
+
 export type SerializedQuery = $Exact<{
   table: TableName<any>,
   description: QueryDescription,
-  associations: AssociationArgs[],
+  associations: QueryAssociation[],
 }>
 
+interface QueryCountProxy {
+  then<U>(
+    onFulfill?: (value: number) => Promise<U> | U,
+    onReject?: (error: any) => Promise<U> | U,
+  ): Promise<U>;
+}
+
 export default class Query<Record: Model> {
+  // Used by withObservables to differentiate between object types
+  static _wmelonTag: string = 'query'
+
   collection: Collection<Record>
 
   description: QueryDescription
@@ -53,18 +67,37 @@ export default class Query<Record: Model> {
   )
 
   // Note: Don't use this directly, use Collection.query(...)
-  constructor(collection: Collection<Record>, conditions: Condition[]): void {
+  constructor(collection: Collection<Record>, clauses: Clause[]): void {
     this.collection = collection
-    this._rawDescription = buildQueryDescription(conditions)
-    this.description = queryWithoutDeleted(this._rawDescription)
+    this._rawDescription = Q.buildQueryDescription(clauses)
+    this.description = Q.queryWithoutDeleted(this._rawDescription)
   }
 
-  // Creates a new Query that extends the conditions of this query
-  extend(...conditions: Condition[]): Query<Record> {
+  // Creates a new Query that extends the clauses of this query
+  extend(...clauses: Clause[]): Query<Record> {
     const { collection } = this
-    const { select, join, where } = this._rawDescription
+    const {
+      select,
+      where,
+      sortBy,
+      take,
+      skip,
+      joinTables,
+      nestedJoinTables,
+      lokiTransform,
+    } = this._rawDescription
 
-    return new Query(collection, [...select, ...join, ...where, ...conditions])
+    return new Query(collection, [
+      Q.experimentalJoinTables(joinTables),
+      ...nestedJoinTables.map(({ from, to }) => Q.experimentalNestedJoin(from, to)),
+      ...select,
+      ...where,
+      ...sortBy,
+      ...(take ? [Q.experimentalTake(take)] : []),
+      ...(skip ? [Q.experimentalSkip(skip)] : []),
+      ...(lokiTransform ? [Q.unsafeLokiTransform(lokiTransform)] : []),
+      ...clauses,
+    ])
   }
 
   pipe<T>(transform: this => T): T {
@@ -76,12 +109,20 @@ export default class Query<Record: Model> {
     return toPromise(callback => this.collection._fetchQuery(this, callback))
   }
 
-  experimentalFetchColumns(columnNames: ColumnName[]): Promise<RecordState[]> {
-    const queryWithSelect = this.extend(experimentalSelect(columnNames))
+  then<U>(
+    onFulfill?: (value: Record[]) => Promise<U> | U,
+    onReject?: (error: any) => Promise<U> | U,
+  ): Promise<U> {
+    // $FlowFixMe
+    return this.fetch().then(onFulfill, onReject)
+  }
+
+  experimentalFetchColumns(columnNames: ColumnName[]): Promise<any[]> {
+    const queryWithSelect = this.extend(Q.experimentalSelect(columnNames))
     return toPromise(callback => this.collection._fetchQuerySelect(queryWithSelect, callback))
   }
 
-  // Emits an array of matching records, then emits a new array every time it changess
+  // Emits an array of matching records, then emits a new array every time it changes
   observe(): Observable<Record[]> {
     return Observable.create(observer =>
       this._cachedSubscribable.subscribe(records => {
@@ -104,7 +145,7 @@ export default class Query<Record: Model> {
   // selected `columnNames` (and `id` property added implicitly).
   // Note: This is an experimental feature and this API might change in future versions.
   experimentalObserveColumns(columnNames: ColumnName[]): Observable<RecordState[]> {
-    const queryWithSelect = this.extend(experimentalSelect(columnNames))
+    const queryWithSelect = this.extend(Q.experimentalSelect(columnNames))
     return Observable.create(observer =>
       subscribeToQueryWithSelect(queryWithSelect, records => {
         observer.next(records)
@@ -112,9 +153,23 @@ export default class Query<Record: Model> {
     )
   }
 
+
   // Returns the number of matching records
   fetchCount(): Promise<number> {
     return toPromise(callback => this.collection._fetchCount(this, callback))
+  }
+
+  get count(): QueryCountProxy {
+    const model = this
+    return {
+      then<U>(
+        onFulfill?: (value: number) => Promise<U> | U,
+        onReject?: (error: any) => Promise<U> | U,
+      ): Promise<U> {
+        // $FlowFixMe
+        return model.fetchCount().then(onFulfill, onReject)
+      },
+    }
   }
 
   // Emits the number of matching records, then emits a new count every time it changes
@@ -146,7 +201,7 @@ export default class Query<Record: Model> {
   }
 
   getSelectedColumns(): ColumnName[] {
-    return getSelectedColumns(this.description)
+    return Q.getSelectedColumns(this.description)
   }
 
   // Marks as deleted all records matching the query
@@ -168,24 +223,26 @@ export default class Query<Record: Model> {
   }
 
   get table(): TableName<Record> {
+    // $FlowFixMe
     return this.modelClass.table
   }
 
   get secondaryTables(): TableName<any>[] {
-    return getSecondaryTables(this.description)
+    return this.description.joinTables.concat(this.description.nestedJoinTables.map(({ to }) => to))
   }
 
   get allTables(): TableName<any>[] {
-    return prepend(this.table, this.secondaryTables)
+    return [this.table].concat(this.secondaryTables)
   }
 
-  get associations(): AssociationArgs[] {
-    return getAssociations(this.secondaryTables, this.modelClass.associations)
+  get associations(): QueryAssociation[] {
+    return getAssociations(this.description, this.modelClass, this.collection.db)
   }
 
-  // `true` if query contains conditions on foreign tables
+  // `true` if query contains join clauses on foreign tables
   get hasJoins(): boolean {
-    return !!this.description.join.length
+    logger.warn('DEPRECATION: Query.hasJoins is deprecated')
+    return !!this.secondaryTables.length
   }
 
   // Serialized version of Query (e.g. for sending to web worker)

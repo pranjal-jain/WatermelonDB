@@ -1,8 +1,6 @@
 // @flow
 
-import { Observable } from 'rxjs/Observable'
-import { switchMap, distinctUntilChanged, throttleTime } from 'rxjs/operators'
-
+import { Observable, switchMap, distinctUntilChanged, throttleTime } from '../../utils/rx'
 import { logError } from '../../utils/common'
 import { toPromise } from '../../utils/fp/Result'
 import { type Unsubscribe } from '../../utils/subscriptions'
@@ -60,7 +58,11 @@ export default function subscribeToCount<Record: Model>(
     })
   }
 
-  const unsubscribe = collection.database.experimentalSubscribe(query.allTables, observeCountFetch)
+  const unsubscribe = collection.database.experimentalSubscribe(
+    query.allTables,
+    observeCountFetch,
+    { name: 'subscribeToCount', query, subscriber },
+  )
   observeCountFetch()
 
   return () => {

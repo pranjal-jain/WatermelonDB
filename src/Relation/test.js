@@ -126,6 +126,10 @@ describe('Relation', () => {
 
     currentRecord = await relation.fetch()
     expect(currentRecord).toBe(newSecondary)
+
+    // test thenable syntax
+    expect(await relation).toBe(currentRecord)
+    expect(await relation.then(model => [model])).toEqual([currentRecord])
   })
   it('caches observable', () => {
     const { tasks } = mockDatabase()
@@ -136,5 +140,11 @@ describe('Relation', () => {
     const observable2 = relation.observe()
 
     expect(observable1).toBe(observable2)
+  })
+  it(`has wmelon tag`, () => {
+    const { tasks } = mockDatabase()
+    const model = new MockTask(tasks, {})
+    const relation = new Relation(model, 't1', 'c1', { isImmutable: false })
+    expect(relation.constructor._wmelonTag).toBe('relation')
   })
 })

@@ -16,7 +16,7 @@ import encodeMatcher, { type Matcher } from '../encodeMatcher'
 import { getSelectedColumns } from '../../QueryDescription'
 
 // WARN: Mutates arguments
-export function processChangeSet<Record: Model>(
+function processChangeSet<Record: Model>(
   changeSet: CollectionChangeSet<Record>,
   columnNames: ColumnName[],
   matcher: Matcher<Record>,
@@ -37,11 +37,11 @@ export function processChangeSet<Record: Model>(
       return
     }
 
-    if(type === CollectionChangeTypes.updated) {
-      if(currentlyMatching) {
+    if (type === CollectionChangeTypes.updated) {
+      if (currentlyMatching) {
         const prevState = mutableMatchingRecords[index]
         const newState = getRecordState(record._raw, columnNames)
-        if(!recordStatesEqual(prevState, newState)) {
+        if (!recordStatesEqual(prevState, newState)) {
           mutableMatchingRecords[index] = newState
           shouldEmit = true
         }

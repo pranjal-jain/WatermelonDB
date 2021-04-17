@@ -52,7 +52,7 @@ class DatabaseDriver(context: Context, dbName: String) {
         if (isCached(table, id)) {
             return id
         }
-        database.rawQuery("select * from $table where id == ? limit 1", arrayOf(id)).use {
+        database.rawQuery("select * from `$table` where id == ? limit 1", arrayOf(id)).use {
             if (it.count <= 0) {
                 return null
             }
@@ -82,7 +82,7 @@ class DatabaseDriver(context: Context, dbName: String) {
                     if (isCached(table, id)) {
                         resultArray.pushString(id)
                     } else {
-                        if(willCache) {
+                        if (willCache) {
                             markAsCached(table, id)
                         }
                         resultArray.pushMapFromCursor(it)
@@ -122,7 +122,7 @@ class DatabaseDriver(context: Context, dbName: String) {
     }
 
     fun getLocal(key: String): String? {
-        log?.info("Get Local: $key")
+        // log?.info("Get Local: $key")
         return database.getFromLocalStorage(key)
     }
 
@@ -142,7 +142,7 @@ class DatabaseDriver(context: Context, dbName: String) {
     }
 
     fun batch(operations: ReadableArray) {
-        log?.info("Batch of ${operations.size()}")
+        // log?.info("Batch of ${operations.size()}")
         val newIds = arrayListOf<Pair<TableName, RecordID>>()
         val removedIds = arrayListOf<Pair<TableName, RecordID>>()
 
@@ -224,7 +224,7 @@ class DatabaseDriver(context: Context, dbName: String) {
 
     private fun setUpSchema(schema: Schema) {
         database.transaction {
-            database.executeStatements(schema.sql + Queries.localStorageSchema)
+            database.unsafeExecuteStatements(schema.sql + Queries.localStorageSchema)
             database.userVersion = schema.version
         }
     }
@@ -236,7 +236,7 @@ class DatabaseDriver(context: Context, dbName: String) {
         }
 
         database.transaction {
-            database.executeStatements(migrations.sql)
+            database.unsafeExecuteStatements(migrations.sql)
             database.userVersion = migrations.to
         }
     }

@@ -2,7 +2,219 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+Contributors: Please add your changes to CHANGELOG-Unreleased.md
+
+## 0.21 - 2021-03-24
+
+### BREAKING CHANGES
+
+- [LokiJS] `useWebWorker` and `useIncrementalIndexedDB` options are now required (previously, skipping them would only trigger a warning)
+
+### New features
+
+- [Model] `Model.update` method now returns updated record
+- [adapters] `onSetUpError: Error => void` option is added to both `SQLiteAdapter` and `LokiJSAdapter`. Supply this option to catch initialization errors and offer the user to reload or log out
+- [LokiJS] new `extraLokiOptions` and `extraIncrementalIDBOptions` options
+- [Android] Autolinking is now supported.
+  - If You upgrade to `<= v0.21.0` **AND** are on a version of React Native which supports Autolinking, you will need to remove the config manually linking WatermelonDB.
+  - You can resolve this issue by **REMOVING** the lines of config from your project which are _added_ in the `Manual Install ONLY` section of the [Android Install docs](https://nozbe.github.io/WatermelonDB/Installation.html#android-react-native).
+
+### Performance
+
+- [LokiJS] Improved performance of launching the app
+
+### Changes
+
+- [LokiJS] `useWebWorker: true` and `useIncrementalIndexedDB: false` options are now deprecated. If you rely on these features, please file an issue!
+- [Sync] Optional `log` passed to sync now has more helpful diagnostic information
+- [Sync] Open-sourced a simple SyncLogger you can optionally use. See docs for more info.
+- [SQLiteAdapter] `synchronous:true` option is now deprecated and will be replaced with `experimentalUseJSI: true` in the future. Please test if your app compiles and works well with `experimentalUseJSI: true`, and if not - file an issue!
+- [LokiJS] Changed default autosave interval from 250 to 500ms
+- [Typescript] Add `experimentalNestedJoin` definition and `unsafeSqlExpr` clause
+
+### Fixes
+
+- [LokiJS] Fixed a case where IndexedDB could get corrupted over time
+- [Resilience] Added extra diagnostics for when you encounter the `Record ID aa#bb was sent over the bridge, but it's not cached` error and a recovery path (LokiJSAdapter-only). Please file an issue if you encounter this issue!
+- [Typescript] Fixed type on OnFunction to accept `and` in join
+- [Typescript] Fixed type `database#batch(records)`'s argument `records` to accept mixed types
+
+### Internal
+
+- Added an experimental mode where a broken database state is detected, further mutations prevented, and the user notified
+
+## 0.20 - 2020-10-05
+
+### BREAKING CHANGES
+
+This release has unintentionally broken RxJS for some apps using `with-observables`. If you have this issue, please update `@nozbe/with-observables` to the latest version.
+
+### New features
+
+- [Sync] Conflict resolution can now be customized. See docs for more details
+- [Android] Autolinking is now supported
+- [LokiJS] Adapter autosave option is now configurable
+
+### Changes
+
+- Interal RxJS imports have been refactor such that rxjs-compat should never be used now
+- [Performance] Tweak Babel config to produce smaller code
+- [Performance] LokiJS-based apps will now take up to 30% less time to load the database (id and unique indicies are generated lazily)
+
+### Fixes
+
+- [iOS] Fixed crash on database reset in apps linked against iOS 14 SDK
+- [LokiJS] Fix `Q.like` being broken for multi-line strings on web
+- Fixed warn "import cycle" from DialogProvider (#786) by @gmonte.
+- Fixed cache date as instance of Date (#828) by @djorkaeffalexandre.
+
+## 0.19 - 2020-08-17
+
+### New features
+
+- [iOS] Added CocoaPods support - @leninlin
+- [NodeJS] Introducing a new SQLite Adapter based integration to NodeJS. This requires a
+peer dependency on [better-sqlite3](https://github.com/JoshuaWise/better-sqlite3)
+and should work with the same configuration as iOS/Android - @sidferreira
+- [Android] `exerimentalUseJSI` option has been enabled on Android. However, it requires some app-specific setup which is not yet documented - stay tuned for upcoming releases
+- [Schema] [Migrations] You can now pass `unsafeSql` parameters to schema builder and migration steps to modify SQL generated to set up the database or perform migrations. There's also new `unsafeExecuteSql` migration step. Please use this only if you know what you're doing — you shouldn't need this in 99% of cases. See Schema and Migrations docs for more details
+- [LokiJS] [Performance] Added experimental `onIndexedDBFetchStart` and `indexedDBSerializer` options to `LokiJSAdapter`. These can be used to improve app launch time. See `src/adapters/lokijs/index.js` for more details.
+
+### Changes
+
+- [Performance] findAndObserve is now able to emit a value synchronously. By extension, this makes Relations put into withObservables able to render the child component in one shot. Avoiding the extra unnecessary render cycles avoids a lot of DOM and React commit-phase work, which can speed up loading some views by 30%
+- [Performance] LokiJS is now faster (refactored encodeQuery, skipped unnecessary clone operations)
+
+## 0.18 - 2020-06-30
+
+Another WatermelonDB release after just a week? Yup! And it's jam-packed full of features!
+
+### New features
+
+- [Query] `Q.on` queries are now far more flexible. Previously, they could only be placed at the top
+    level of a query. See Docs for more details. Now, you can:
+
+     - Pass multiple conditions on the related query, like so:
+
+        ```js
+        collection.query(
+          Q.on('projects', [
+            Q.where('foo', 'bar'),
+            Q.where('bar', 'baz'),
+          ])
+        )
+        ```
+     - You can place `Q.on` deeper inside the query (nested inside `Q.and()`, `Q.or()`). However, you
+        must explicitly list all tables you're joining on at the beginning of a query, using:
+        `Q.experimentalJoinTables(['join_table1', 'join_table2'])`.
+     - You can nest `Q.on` conditions inside `Q.on`, e.g. to make a condition on a grandchild.
+          To do so, it's required to pass `Q.experimentalNestedJoin('parent_table', 'grandparent_table')` at the beginning
+          of a query
+- [Query] `Q.unsafeSqlExpr()` and `Q.unsafeLokiExpr()` are introduced to allow adding bits of queries
+    that are not supported by the WatermelonDB query language without having to use `unsafeFetchRecordsWithSQL()`.
+    See docs for more details
+- [Query] `Q.unsafeLokiFilter((rawRecord, loki) => boolean)` can now be used as an escape hatch to make
+    queries with LokiJSAdapter that are not otherwise possible (e.g. multi-table column comparisons).
+    See docs for more details
+
+### Changes
+
+- [Performance] [LokiJS] Improved performance of queries containing query comparisons on LokiJSAdapter
+- [Docs] Added Contributing guide for Query language improvements
+- [Deprecation] `Query.hasJoins` is deprecated
+- [DX] Queries with bad associations now show more helpful error message
+- [Query] Counting queries that contain `Q.experimentalTake` / `Q.experimentalSkip` is currently broken - previously it would return incorrect results, but
+    now it will throw an error to avoid confusion. Please contribute to fix the root cause!
+
+### Fixes
+
+- [Typescript] Fixed types of Relation
+
+### Internal
+
+- `QueryDescription` structure has been changed.
+
+## 0.17.1 - 2020-06-24
+
+- Fixed broken iOS build - @mlecoq
+
+## 0.17 - 2020-06-22
+
+### New features
+
+- [Sync] Introducing Migration Syncs - this allows fully consistent synchronization when migrating
+      between schema versions. Previously, there was no mechanism to incrementally fetch all remote changes in
+      new tables and columns after a migration - so local copy was likely inconsistent, requiring a re-login.
+      After adopting migration syncs, Watermelon Sync will request from backend all missing information.
+      See Sync docs for more details.
+- [iOS] Introducing a new native SQLite database integration, rewritten from scratch in C++, based
+       on React Native's JSI (JavaScript Interface). It is to be considered experimental, however
+       we intend to make it the default (and eventually, the only) implementation. In a later release,
+       Android version will be introduced.
+
+       The new adapter is up to 3x faster than the previously fastest `synchronous: true` option,
+       however this speedup is only achieved with some unpublished React Native patches.
+
+       To try out JSI, add `experimentalUseJSI: true` to `SQLiteAdapter` constructor.
+- [Query] Added `Q.experimentalSortBy(sortColumn, sortOrder)`, `Q.experimentalTake(count)`,
+     `Q.experimentalSkip(count)` methods (only availble with SQLiteAdapter) - @Kenneth-KT
+- `Database.batch()` can now be called with a single array of models
+- [DX] `Database.get(tableName)` is now a shortcut for `Database.collections.get(tableName)`
+- [DX] Query is now thenable - you can now use `await query` and `await query.count` instead of `await query.fetch()` and `await query.fetchCount()`
+- [DX] Relation is now thenable - you can now use `await relation` instead of `await relation.fetch()`
+- [DX] Exposed `collection.db` and `model.db` as shortcuts to get to their Database object
+
+### Changes
+
+- [Hardening] Column and table names starting with `__`, Object property names (e.g. `constructor`), and some reserved keywords are now forbidden
+- [DX] [Hardening] QueryDescription builder methods do tighter type checks, catching more bugs, and
+  preventing users from unwisely passing unsanitized user data into Query builder methods
+- [DX] [Hardening] Adapters check early if table names are valid
+- [DX] Collection.find reports an error more quickly if an obviously invalid ID is passed
+- [DX] Intializing Database with invalid model classes will now show a helpful error
+- [DX] DatabaseProvider shows a more helpful error if used improperly
+- [Sync] Sync no longer fails if pullChanges returns collections that don't exist on the frontend - shows a warning instead. This is to make building backwards-compatible backends less error-prone
+- [Sync] [Docs] Sync documentation has been rewritten, and is now closer in detail to a formal specification
+- [Hardening] database.collections.get() better validates passed value
+- [Hardening] Prevents unsafe strings from being passed as column name/table name arguments in QueryDescription
+
+### Fixes
+
+- [Sync] Fixed `RangeError: Maximum call stack size exceeded` when syncing large amounts of data - @leninlin
+- [iOS] Fixed a bug that could cause a database operation to fail with an (6) SQLITE_LOCKED error
+- [iOS] Fixed 'jsi/jsi.h' file not found when building at the consumer level. Added path `$(SRCROOT)/../../../../../ios/Pods/Headers/Public/React-jsi` to Header Search Paths (issue #691) - @victorbutler
+- [Native] SQLite keywords used as table or column names no longer crash
+- Fixed potential issues when subscribing to database, collection, model, queries passing a subscriber function with the same identity more than once
+
+### Internal
+
+- Fixed broken adapter tests
+
+## 0.15.1, 0.16.1-fix, 0.16.2 - 2020-06-03
+
+This is a security patch for a vulnerability that could cause maliciously crafted record IDs to
+cause all or some of user's data to be deleted. More information available via GitHub security advisory
+
+## 0.16.1 - 2020-05-18
+
+### Changes
+
+- `Database.unsafeResetDatabase()` is now less unsafe — more application bugs are being caught
+
+### Fixes
+
+- [iOS] Fix build in apps using Flipper
+- [Typescript] Added type definition for `setGenerator`.
+- [Typescript] Fixed types of decorators.
+- [Typescript] Add Tests to test Types.
+- Fixed typo in learn-to-use docs.
+- [Typescript] Fixed types of changes.
+
+### Internal
+
+- [SQLite] Infrastruture for a future JSI adapter has been added
+
+## 0.16 - 2020-03-06
 
 ### ⚠️ Breaking
 
@@ -23,8 +235,6 @@ All notable changes to this project will be documented in this file.
   This is called when underlying IndexedDB encountered a quota exceeded error (ran out of allotted disk space for app)
   This means that app can't save more data or that it will fall back to using in-memory database only
   Note that this only works when `useWebWorker: false`
-- [Query] Added experimental `query.experimentalFetchColumns(['col1', 'col2'])` and `query.experimentalObserveColumns(['col1', 'col2'])`
-  and methods to fetch and observe on record states with only the selected columns.
 
 ### Changes
 
