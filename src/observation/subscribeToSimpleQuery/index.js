@@ -1,6 +1,6 @@
 // @flow
 
-import { invariant, logError } from '../../utils/common'
+import { logError } from '../../utils/common'
 import { type Unsubscribe } from '../../utils/subscriptions'
 
 import type { CollectionChangeSet } from '../../Collection'
@@ -54,8 +54,6 @@ export default function subscribeToSimpleQuery<Record: Model>(
   // observeQueryWithColumns
   alwaysEmit: boolean = false,
 ): Unsubscribe {
-  invariant(!query.hasJoins, 'subscribeToSimpleQuery only supports simple queries!')
-
   const matcher: Matcher<Record> = encodeMatcher(query.description)
   let unsubscribed = false
   let unsubscribe = null
@@ -83,6 +81,7 @@ export default function subscribeToSimpleQuery<Record: Model>(
     }
 
     // Observe changes to the collection
+    const debugInfo = { name: 'subscribeToSimpleQuery', query, subscriber }
     unsubscribe = query.collection.experimentalSubscribe(function observeQueryCollectionChanged(
       changeSet,
     ): void {
@@ -90,7 +89,8 @@ export default function subscribeToSimpleQuery<Record: Model>(
       if (shouldEmit || alwaysEmit) {
         emitCopy()
       }
-    })
+    },
+    debugInfo)
   })
 
   return () => {

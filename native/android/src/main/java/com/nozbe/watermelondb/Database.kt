@@ -10,6 +10,8 @@ class Database(private val name: String, private val context: Context) {
     private val db: SQLiteDatabase by lazy {
         SQLiteDatabase.openOrCreateDatabase(
                 // TODO: This SUCKS. Seems like Android doesn't like sqlite `?mode=memory&cache=shared` mode. To avoid random breakages, save the file to /tmp, but this is slow.
+                // NOTE: This is because Android system SQLite is not compiled with SQLITE_USE_URI=1
+                // issue `PRAGMA cache=shared` query after connection when needed
                 if (name == ":memory:" || name.contains("mode=memory")) {
                     context.cacheDir.delete()
                     File(context.cacheDir, name).path
@@ -25,8 +27,10 @@ class Database(private val name: String, private val context: Context) {
             db.version = value
         }
 
-    fun executeStatements(statements: SQL) =
+    fun unsafeExecuteStatements(statements: SQL) =
             transaction {
+                // NOTE: This must NEVER be allowed to take user input - split by `;` is not grammer-aware
+                // and so is unsafe. Only works with Watermelon-generated strings known to be safe
                 statements.split(";").forEach {
                     if (it.isNotBlank()) execute(it)
                 }

@@ -1,6 +1,5 @@
 // @flow
 
-import { keys, values } from 'rambdax'
 import type { TableSchema, AppSchema, ColumnSchema, TableName } from '../../../Schema'
 import { nullValue } from '../../../RawRecord'
 import type {
@@ -17,36 +16,47 @@ const standardColumns = `"id" primary key, "_changed", "_status"`
 
 const encodeCreateTable: TableSchema => SQL = ({ name, columns }) => {
   const columnsSQL = [standardColumns]
-    .concat(keys(columns).map(column => encodeName(column)))
+    .concat(Object.keys(columns).map(column => encodeName(column)))
     .join(', ')
   return `create table ${encodeName(name)} (${columnsSQL});`
 }
 
 const encodeIndex: (ColumnSchema, TableName<any>) => SQL = (column, tableName) =>
   column.isIndexed
-    ? `create index ${tableName}_${column.name} on ${encodeName(tableName)} (${encodeName(
+    ? `create index "${tableName}_${column.name}" on ${encodeName(tableName)} (${encodeName(
         column.name,
       )});`
     : ''
 
 const encodeTableIndicies: TableSchema => SQL = ({ name: tableName, columns }) =>
-  values(columns)
+  Object.values(columns)
+    // $FlowFixMe
     .map(column => encodeIndex(column, tableName))
-    .concat([`create index ${tableName}__status on ${encodeName(tableName)} ("_status");`])
+    .concat([`create index "${tableName}__status" on ${encodeName(tableName)} ("_status");`])
     .join('')
+
+const transform = (sql: string, transformer: ?(string) => string) =>
+  transformer ? transformer(sql) : sql
 
 const encodeTable: TableSchema => SQL = table =>
-  encodeCreateTable(table) + encodeTableIndicies(table)
+  transform(encodeCreateTable(table) + encodeTableIndicies(table), table.unsafeSql)
 
-export const encodeSchema: AppSchema => SQL = ({ tables }) =>
-  values(tables)
+export const encodeSchema: AppSchema => SQL = ({ tables, unsafeSql }) => {
+  const sql = Object.values(tables)
+    // $FlowFixMe
     .map(encodeTable)
     .join('')
+  return transform(sql, unsafeSql)
+}
 
 const encodeCreateTableMigrationStep: CreateTableMigrationStep => SQL = ({ schema }) =>
   encodeTable(schema)
 
-const encodeAddColumnsMigrationStep: AddColumnsMigrationStep => SQL = ({ table, columns }) =>
+const encodeAddColumnsMigrationStep: AddColumnsMigrationStep => SQL = ({
+  table,
+  columns,
+  unsafeSql,
+}) =>
   columns
     .map(column => {
       const addColumn = `alter table ${encodeName(table)} add ${encodeName(column.name)};`
@@ -55,7 +65,7 @@ const encodeAddColumnsMigrationStep: AddColumnsMigrationStep => SQL = ({ table, 
       )} = ${encodeValue(nullValue(column))};`
       const addIndex = encodeIndex(column, table)
 
-      return addColumn + setDefaultValue + addIndex
+      return transform(addColumn + setDefaultValue + addIndex, unsafeSql)
     })
     .join('')
 
@@ -66,6 +76,8 @@ export const encodeMigrationSteps: (MigrationStep[]) => SQL = steps =>
         return encodeCreateTableMigrationStep(step)
       } else if (step.type === 'add_columns') {
         return encodeAddColumnsMigrationStep(step)
+      } else if (step.type === 'sql') {
+        return step.sql
       }
 
       throw new Error(`Unsupported migration step ${step.type}`)

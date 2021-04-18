@@ -13,6 +13,11 @@ import { CollectionChangeTypes } from './common'
 const mockQuery = collection => new Query(collection, [Q.where('a', 'b')])
 
 describe('Collection', () => {
+  it(`exposes database`, () => {
+    const { db, projects } = mockDatabase()
+    expect(projects.database).toBe(db)
+    expect(projects.db).toBe(db)
+  })
   it('exposes schema', () => {
     const { tasks, projects } = mockDatabase()
 
@@ -76,6 +81,27 @@ describe('finding records', () => {
 
     expect(findSpy.mock.calls.length).toBe(2)
   })
+  it('quickly rejects for invalid IDs', async () => {
+    const { tasks } = mockDatabase()
+    await expectToRejectWithMessage(tasks.find(), /Invalid record ID/)
+    await expectToRejectWithMessage(tasks.find(null), /Invalid record ID/)
+    await expectToRejectWithMessage(tasks.find({}), /Invalid record ID/)
+  })
+  it('successfully executes unsafe SQL fetches in the same sequence as normal fetches', async () => {
+    // See: https://github.com/Nozbe/WatermelonDB/issues/931
+    const { tasks: collection, adapter } = mockDatabase()
+
+    adapter.unsafeSqlQuery = (table, sql, cb) => cb({ value: [{ id: 'm1' }] })
+    adapter.cachedQuery = jest.fn().mockImplementation((query, cb) => cb({ value: ['m1', { id: 'm2' }] }))
+
+    const unsafeFetch = collection.unsafeFetchRecordsWithSQL(
+      `SELECT t.* FROM mock_tasks AS t WHERE t.id = 'm1'`,
+    )
+    const normalFetch = collection.query().fetch()
+
+    expect((await normalFetch).map(x => x._raw)).toEqual([{ id: 'm1' }, { id: 'm2' }])
+    expect((await unsafeFetch).map(x => x._raw)).toEqual([{ id: 'm1' }])
+  })
 })
 
 describe('fetching queries', () => {
@@ -134,7 +160,7 @@ describe('fetching queries', () => {
     collection._cache.add(m1)
 
     // fetch, check if error occured
-    const spy = jest.spyOn(logger, 'error').mockImplementation(() => {})
+    const spy = jest.spyOn(logger, 'warn').mockImplementation(() => {})
     const models = await toPromise(cb => collection._fetchQuery(mockQuery(collection), cb))
     expect(spy).toHaveBeenCalledTimes(1)
     spy.mockRestore()
@@ -277,5 +303,25 @@ describe('Collection observation', () => {
     expect(subscriber1).toHaveBeenCalledTimes(1)
 
     unsubscribe1()
+  })
+  it(`can subscribe with the same subscriber multiple times`, async () => {
+    const { database, tasks } = mockDatabase({ actionsEnabled: true })
+    const trigger = () => database.action(() => tasks.create())
+    const subscriber = jest.fn()
+
+    const unsubscribe1 = tasks.experimentalSubscribe(subscriber)
+    expect(subscriber).toHaveBeenCalledTimes(0)
+    await trigger()
+    expect(subscriber).toHaveBeenCalledTimes(1)
+    const unsubscribe2 = tasks.experimentalSubscribe(subscriber)
+    await trigger()
+    expect(subscriber).toHaveBeenCalledTimes(3)
+    unsubscribe2()
+    unsubscribe2() // noop
+    await trigger()
+    expect(subscriber).toHaveBeenCalledTimes(4)
+    unsubscribe1()
+    await trigger()
+    expect(subscriber).toHaveBeenCalledTimes(4)
   })
 })

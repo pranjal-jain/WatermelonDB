@@ -1,17 +1,32 @@
 // @flow
 
 import identicalArrays from '../../utils/fp/identicalArrays'
-import arrayDifference from '../../utils/fp/arrayDifference'
 import { type Unsubscribe } from '../../utils/subscriptions'
 
+import { type Value } from '../../QueryDescription'
 import { type ColumnName } from '../../Schema'
 import type Query from '../../Query'
 import type { CollectionChangeSet } from '../../Collection'
 
 import type Model, { RecordId } from '../../Model'
-import { type RecordState, getRecordState, recordStatesEqual } from '../../RawRecord'
 import subscribeToSimpleQuery from '../subscribeToSimpleQuery'
 import subscribeToQueryReloading from '../subscribeToQueryReloading'
+import canEncodeMatcher from '../encodeMatcher/canEncode'
+
+type RecordState = Value[]
+
+const getRecordState: (Model, ColumnName[]) => RecordState = (record, columnNames) => {
+  const state = []
+  const raw = record._raw
+  for (let i = 0, len = columnNames.length; i < len; i++) {
+    // $FlowFixMe
+    state.push(raw[columnNames[i]])
+  }
+  return state
+}
+
+// Invariant: same length and order of keys!
+const recordStatesEqual: (left: RecordState, right: RecordState) => boolean = identicalArrays
 
 // Observes the given observable list of records, and in those records,
 // changes to given `rawFields`
@@ -46,9 +61,9 @@ export default function subscribeToQueryWithColumns<Record: Model>(
   // TODO: On one hand it would be nice to bring in the source logic to this function to optimize
   // on the other, it would be good to have source provided as Observable, not Query
   // so that we can reuse cached responses -- but they don't have compatible format
-  const [subscribeToSource, asyncSource] = query.hasJoins
-    ? [observer => subscribeToQueryReloading(query, observer, true), false]
-    : [observer => subscribeToSimpleQuery(query, observer, true), false]
+  const [subscribeToSource, asyncSource] = canEncodeMatcher(query.description)
+    ? [observer => subscribeToSimpleQuery(query, observer, true), false]
+    : [observer => subscribeToQueryReloading(query, observer, true), false]
 
   // NOTE:
   // Observing both the source subscription and changes to columns is very tricky
@@ -65,6 +80,7 @@ export default function subscribeToQueryWithColumns<Record: Model>(
   // flag, and wait for source response.
 
   // Observe changes to records we have on the list
+  const debugInfo = { name: 'subscribeToQueryWithColumns', query, columnNames }
   const collectionUnsubscribe = query.collection.experimentalSubscribe(
     function observeWithColumnsCollectionChanged(changeSet: CollectionChangeSet<Record>): void {
       let hasColumnChanges = false
@@ -81,7 +97,7 @@ export default function subscribeToQueryWithColumns<Record: Model>(
         }
 
         // Check if record changed one of its observed fields
-        const newState = getRecordState(record._raw, columnNames)
+        const newState = getRecordState(record, columnNames)
         if (!recordStatesEqual(previousState, newState)) {
           recordStates.set(record.id, newState)
           hasColumnChanges = true
@@ -97,12 +113,14 @@ export default function subscribeToQueryWithColumns<Record: Model>(
         }
       }
     },
+    debugInfo,
   )
 
   // Observe the source records list (list of records matching a query)
   const sourceUnsubscribe = subscribeToSource(function observeWithColumnsSourceChanged(
     recordsOrStatus,
   ): void {
+    // $FlowFixMe
     if (recordsOrStatus === false) {
       sourceIsFetching = true
       return
@@ -118,6 +136,7 @@ export default function subscribeToQueryWithColumns<Record: Model>(
     firstEmission = false
 
     // Find changes, and save current list for comparison on next emission
+    const arrayDifference = require('../../utils/fp/arrayDifference').default
     const { added, removed } = arrayDifference(observedRecords, records)
     observedRecords = records
 
@@ -128,7 +147,7 @@ export default function subscribeToQueryWithColumns<Record: Model>(
 
     // Save current record state for later comparison
     added.forEach(newRecord => {
-      recordStates.set(newRecord.id, getRecordState(newRecord._raw, columnNames))
+      recordStates.set(newRecord.id, getRecordState(newRecord, columnNames))
     })
 
     // Emit

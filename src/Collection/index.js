@@ -1,9 +1,6 @@
 // @flow
-
-import type { Observable } from 'rxjs'
-import { Subject } from 'rxjs/Subject'
-import { defer } from 'rxjs/observable/defer'
-import { switchMap } from 'rxjs/operators'
+import type { SQLDatabaseAdapter } from '../adapters/type'
+import { Observable, Subject } from '../utils/rx'
 import invariant from '../utils/common/invariant'
 import noop from '../utils/fp/noop'
 import { type ResultCallback, toPromise, mapValue } from '../utils/fp/Result'
@@ -12,7 +9,7 @@ import { type Unsubscribe } from '../utils/subscriptions'
 import Query from '../Query'
 import type Database from '../Database'
 import type Model, { RecordId } from '../Model'
-import type { Condition } from '../QueryDescription'
+import type { Clause } from '../QueryDescription'
 import { type TableName, type TableSchema } from '../Schema'
 import { type DirtyRaw, type RecordState } from '../RawRecord'
 
@@ -37,27 +34,53 @@ export default class Collection<Record: Model> {
   constructor(database: Database, ModelClass: Class<Record>): void {
     this.database = database
     this.modelClass = ModelClass
-    this._cache = new RecordCache(ModelClass.table, raw => new ModelClass(this, raw))
+    this._cache = new RecordCache<Record>(
+      (ModelClass.table: $FlowFixMe),
+      raw => new ModelClass((this: $FlowFixMe), raw),
+      this,
+    )
+  }
+
+  get db(): Database {
+    return this.database
   }
 
   // Finds a record with the given ID
   // Promise will reject if not found
   async find(id: RecordId): Promise<Record> {
-    invariant(id, `Invalid record ID ${this.table}#${id}`)
-
-    const cachedRecord = this._cache.get(id)
-    return cachedRecord || toPromise(callback => this._fetchRecord(id, callback))
+    return toPromise(callback => this._fetchRecord(id, callback))
   }
 
   // Finds the given record and starts observing it
   // (with the same semantics as when calling `model.observe()`)
   findAndObserve(id: RecordId): Observable<Record> {
-    return defer(() => this.find(id)).pipe(switchMap(model => model.observe()))
+    return Observable.create(observer => {
+      let unsubscribe = null
+      let unsubscribed = false
+      this._fetchRecord(id, result => {
+        if (result.value) {
+          const record = result.value
+          observer.next(record)
+          unsubscribe = record.experimentalSubscribe(isDeleted => {
+            if (!unsubscribed) {
+              isDeleted ? observer.complete() : observer.next(record)
+            }
+          })
+        } else {
+          // $FlowFixMe
+          observer.error(result.error)
+        }
+      })
+      return () => {
+        unsubscribed = true
+        unsubscribe && unsubscribe()
+      }
+    })
   }
 
   // Query records of this type
-  query(...conditions: Condition[]): Query<Record> {
-    return new Query(this, conditions)
+  query(...clauses: Clause[]): Query<Record> {
+    return new Query(this, clauses)
   }
 
   // Creates a new record in this collection
@@ -80,6 +103,7 @@ export default class Collection<Record: Model> {
   // Prepares a new record in this collection
   // Use this to batch-create multiple records
   prepareCreate(recordBuilder: Record => void = noop): Record {
+    // $FlowFixMe
     return this.modelClass._prepareCreate(this, recordBuilder)
   }
 
@@ -87,25 +111,33 @@ export default class Collection<Record: Model> {
   // e.g. `{ foo: 'bar' }`. Don't use this unless you know how RawRecords work in WatermelonDB
   // this is useful as a performance optimization or if you're implementing your own sync mechanism
   prepareCreateFromDirtyRaw(dirtyRaw: DirtyRaw): Record {
+    // $FlowFixMe
     return this.modelClass._prepareCreateFromDirtyRaw(this, dirtyRaw)
   }
 
   // *** Implementation of Query APIs ***
 
-  async unsafeFetchRecordsWithSQL(sql: string): Promise<Record[]> {
-    const { adapter } = this.database
+  unsafeFetchRecordsWithSQL(sql: string): Promise<Record[]> {
+    const {
+      adapter: { underlyingAdapter },
+    } = this.database
     invariant(
-      typeof adapter.unsafeSqlQuery === 'function',
-      'unsafeFetchRecordsWithSQL called on database that does not support SQL',
+      // $FlowFixMe
+      typeof underlyingAdapter.unsafeSqlQuery === 'function',
+      'unsafeFetchRecordsWithSQL called on a database that does not support SQL',
     )
-    const rawRecords = await adapter.unsafeSqlQuery(this.modelClass.table, sql)
-
-    return this._cache.recordsFromQueryResult(rawRecords)
+    const sqlAdapter: SQLDatabaseAdapter = (underlyingAdapter: any)
+    return toPromise(callback => {
+      sqlAdapter.unsafeSqlQuery(this.modelClass.table, sql, result =>
+        callback(mapValue(rawRecords => this._cache.recordsFromQueryResult(rawRecords), result)),
+      )
+    })
   }
 
   // *** Implementation details ***
 
   get table(): TableName<Record> {
+    // $FlowFixMe
     return this.modelClass.table
   }
 
@@ -134,6 +166,18 @@ export default class Collection<Record: Model> {
 
   // Fetches exactly one record (See: Collection.find)
   _fetchRecord(id: RecordId, callback: ResultCallback<Record>): void {
+    if (typeof id !== 'string') {
+      callback({ error: new Error(`Invalid record ID ${this.table}#${id}`) })
+      return
+    }
+
+    const cachedRecord = this._cache.get(id)
+
+    if (cachedRecord) {
+      callback({ value: cachedRecord })
+      return
+    }
+
     this.database.adapter.underlyingAdapter.find(this.table, id, result =>
       callback(
         mapValue(rawRecord => {
@@ -156,27 +200,33 @@ export default class Collection<Record: Model> {
   }
 
   _notify(operations: CollectionChangeSet<Record>): void {
-    this._subscribers.forEach(subscriber => {
+    const collectionChangeNotifySubscribers = ([subscriber]): void => {
       subscriber(operations)
-    })
+    }
+    this._subscribers.forEach(collectionChangeNotifySubscribers)
     this.changes.next(operations)
 
-    operations.forEach(({ record, type }) => {
+    const collectionChangeNotifyModels = ({ record, type }): void => {
       if (type === CollectionChangeTypes.updated) {
         record._notifyChanged()
       } else if (type === CollectionChangeTypes.destroyed) {
         record._notifyDestroyed()
       }
-    })
+    }
+    operations.forEach(collectionChangeNotifyModels)
   }
 
-  _subscribers: Array<(CollectionChangeSet<Record>) => void> = []
+  _subscribers: [(CollectionChangeSet<Record>) => void, any][] = []
 
-  experimentalSubscribe(subscriber: (CollectionChangeSet<Record>) => void): Unsubscribe {
-    this._subscribers.push(subscriber)
+  experimentalSubscribe(
+    subscriber: (CollectionChangeSet<Record>) => void,
+    debugInfo?: any,
+  ): Unsubscribe {
+    const entry = [subscriber, debugInfo]
+    this._subscribers.push(entry)
 
     return () => {
-      const idx = this._subscribers.indexOf(subscriber)
+      const idx = this._subscribers.indexOf(entry)
       idx !== -1 && this._subscribers.splice(idx, 1)
     }
   }

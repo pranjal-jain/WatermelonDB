@@ -24,6 +24,8 @@ declare module '@nozbe/watermelondb/adapters/sqlite' {
     dbName?: string
     migrations?: SchemaMigrations
     schema: AppSchema
+    synchronous?: boolean
+    jsi?: boolean
   }
 
   export default class SQLiteAdapter implements DatabaseAdapter {

@@ -1,7 +1,6 @@
 // @flow
 
-import type { Observable } from 'rxjs'
-import { BehaviorSubject } from 'rxjs/BehaviorSubject'
+import { type Observable, BehaviorSubject } from '../utils/rx'
 import { type Unsubscribe } from '../utils/subscriptions'
 import invariant from '../utils/common/invariant'
 import ensureSync from '../utils/common/ensureSync'
@@ -17,7 +16,7 @@ import type { Value } from '../QueryDescription'
 import { type RawRecord, type DirtyRaw, sanitizedRaw, setRawSanitized } from '../RawRecord'
 import { setRawColumnChange } from '../sync/helpers'
 
-import { createTimestampsFor, hasUpdatedAt, fetchChildren } from './helpers'
+import { createTimestampsFor, fetchChildren } from './helpers'
 
 export type RecordId = string
 
@@ -41,9 +40,12 @@ export default class Model {
   // Set this in concrete Models to define relationships between different records
   static associations: Associations = {}
 
+  // Used by withObservables to differentiate between object types
+  static _wmelonTag: string = 'model'
+
   _raw: RawRecord
 
-  _isEditing = false
+  _isEditing: boolean = false
 
   // `false` when instantiated but not yet in the database
   _isCommitted: boolean = true
@@ -80,12 +82,13 @@ export default class Model {
   // someTask.update(task => {
   //   task.name = 'New name'
   // })
-  async update(recordUpdater: this => void = noop): Promise<void> {
+  async update(recordUpdater: this => void = noop): Promise<this> {
     this.collection.database._ensureInAction(
       `Model.update() can only be called from inside of an Action. See docs for more details.`,
     )
-    this.prepareUpdate(recordUpdater)
+    const record = this.prepareUpdate(recordUpdater)
     await this.collection.database.batch(this)
+    return record
   }
 
   // Prepares an update to the database (using passed function).
@@ -100,7 +103,7 @@ export default class Model {
     this._isEditing = true
 
     // Touch updatedAt (if available)
-    if (hasUpdatedAt(this)) {
+    if ('updatedAt' in this) {
       this._setRaw(columnName('updated_at'), Date.now())
     }
 
@@ -112,11 +115,18 @@ export default class Model {
     // TODO: `process.nextTick` doesn't work on React Native
     // We could polyfill with setImmediate, but it doesn't have the same effect — test and enseure
     // it would actually work for this purpose
-    if (process.env.NODE_ENV !== 'production' && process && process.nextTick) {
+    if (
+      process.env.NODE_ENV !== 'production' &&
+      typeof process !== 'undefined' &&
+      process &&
+      process.nextTick
+    ) {
       process.nextTick(() => {
         invariant(
           !this._hasPendingUpdate,
-          `record.prepareUpdate was called on ${this.table}#${this.id} but wasn't sent to batch() synchronously -- this is bad!`,
+          `record.prepareUpdate was called on ${this.table}#${
+            this.id
+          } but wasn't sent to batch() synchronously -- this is bad!`,
         )
       })
     }
@@ -206,6 +216,10 @@ export default class Model {
     return this.collection.database
   }
 
+  get db(): Database {
+    return this.collection.database
+  }
+
   get asModel(): this {
     return this
   }
@@ -259,27 +273,28 @@ export default class Model {
     return record
   }
 
-  _subscribers: Array<(isDeleted: boolean) => void> = []
+  _subscribers: [(isDeleted: boolean) => void, any][] = []
 
-  experimentalSubscribe(subscriber: (isDeleted: boolean) => void): Unsubscribe {
-    this._subscribers.push(subscriber)
+  experimentalSubscribe(subscriber: (isDeleted: boolean) => void, debugInfo?: any): Unsubscribe {
+    const entry = [subscriber, debugInfo]
+    this._subscribers.push(entry)
 
     return () => {
-      const idx = this._subscribers.indexOf(subscriber)
+      const idx = this._subscribers.indexOf(entry)
       idx !== -1 && this._subscribers.splice(idx, 1)
     }
   }
 
   _notifyChanged(): void {
     this._getChanges().next(this)
-    this._subscribers.forEach(subscriber => {
+    this._subscribers.forEach(([subscriber]) => {
       subscriber(false)
     })
   }
 
   _notifyDestroyed(): void {
     this._getChanges().complete()
-    this._subscribers.forEach(subscriber => {
+    this._subscribers.forEach(([subscriber]) => {
       subscriber(true)
     })
   }

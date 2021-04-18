@@ -1,18 +1,14 @@
 // @flow
 
-import type { Observable } from 'rxjs/Observable'
-import { merge as merge$ } from 'rxjs/observable/merge'
-import { startWith } from 'rxjs/operators'
-import { values } from 'rambdax'
-
+import { type Observable, startWith, merge as merge$ } from '../utils/rx'
 import { type Unsubscribe } from '../utils/subscriptions'
-import { invariant } from '../utils/common'
+import { invariant, logger } from '../utils/common'
 import { noop } from '../utils/fp'
 
 import type { DatabaseAdapter, BatchOperation } from '../adapters/type'
 import DatabaseAdapterCompat from '../adapters/compat'
 import type Model from '../Model'
-import { type CollectionChangeSet } from '../Collection'
+import type Collection, { CollectionChangeSet } from '../Collection'
 import { CollectionChangeTypes } from '../Collection/common'
 import type { TableName, AppSchema } from '../Schema'
 
@@ -25,6 +21,12 @@ type DatabaseProps = $Exact<{
   actionsEnabled: boolean,
 }>
 
+let experimentalAllowsFatalError = false
+
+export function setExperimentalAllowsFatalError(): void {
+  experimentalAllowsFatalError = true
+}
+
 export default class Database {
   adapter: DatabaseAdapterCompat
 
@@ -32,9 +34,12 @@ export default class Database {
 
   collections: CollectionMap
 
-  _actionQueue = new ActionQueue()
+  _actionQueue: ActionQueue = new ActionQueue()
 
   _actionsEnabled: boolean
+
+  // (experimental) if true, Database is in a broken state and should not be used anymore
+  _isBroken: boolean = false
 
   constructor({ adapter, modelClasses, actionsEnabled }: DatabaseProps): void {
     if (process.env.NODE_ENV !== 'production') {
@@ -54,10 +59,24 @@ export default class Database {
     this._actionsEnabled = actionsEnabled
   }
 
+  get<T: Model>(tableName: TableName<T>): Collection<T> {
+    return this.collections.get(tableName)
+  }
+
   // Executes multiple prepared operations
   // (made with `collection.prepareCreate` and `record.prepareUpdate`)
   // Note: falsy values (null, undefined, false) passed to batch are just ignored
-  async batch(...records: $ReadOnlyArray<Model | null | void | false>): Promise<void> {
+  async batch(...records: $ReadOnlyArray<Model | Model[] | null | void | false>): Promise<void> {
+    if (!Array.isArray(records[0])) {
+      // $FlowFixMe
+      return this.batch(records)
+    }
+    invariant(
+      records.length === 1,
+      'batch should be called with a list of models or a single array',
+    )
+    const actualRecords = records[0]
+
     this._ensureInAction(
       `Database.batch() can only be called from inside of an Action. See docs for more details.`,
     )
@@ -65,7 +84,7 @@ export default class Database {
     // performance critical - using mutations
     const batchOperations: BatchOperation[] = []
     const changeNotifications: { [collectionName: TableName<any>]: CollectionChangeSet<*> } = {}
-    records.forEach(record => {
+    actualRecords.forEach(record => {
       if (!record) {
         return
       }
@@ -118,11 +137,13 @@ export default class Database {
     })
 
     const affectedTables = Object.keys(changeNotifications)
-    this._subscribers.forEach(([tables, subscriber]) => {
+    const databaseChangeNotifySubscribers = ([tables, subscriber]): void => {
       if (tables.some(table => affectedTables.includes(table))) {
         subscriber()
       }
-    })
+    }
+    this._subscribers.forEach(databaseChangeNotifySubscribers)
+    return undefined // shuts up flow
   }
 
   // Enqueues an Action -- a block of code that, when its ran, has a guarantee that no other Action
@@ -135,6 +156,15 @@ export default class Database {
     return this._actionQueue.enqueue(work, description)
   }
 
+  /* EXPERIMENTAL API - DO NOT USE */
+  _write<T>(work: ActionInterface => Promise<T>, description?: string): Promise<T> {
+    return this._actionQueue.enqueue(work, description)
+  }
+
+  _read<T>(work: ActionInterface => Promise<T>, description?: string): Promise<T> {
+    return this._actionQueue.enqueue(work, description)
+  }
+
   // Emits a signal immediately, and on change in any of the passed tables
   withChangesForTables(tables: TableName<any>[]): Observable<CollectionChangeSet<any> | null> {
     const changesSignals = tables.map(table => this.collections.get(table).changes)
@@ -142,24 +172,30 @@ export default class Database {
     return merge$(...changesSignals).pipe(startWith(null))
   }
 
-  _subscribers: Array<[TableName<any>[], () => void]> = []
+  _subscribers: [TableName<any>[], () => void, any][] = []
 
   // Notifies `subscriber` on change in any of passed tables (only a signal, no change set)
-  experimentalSubscribe(tables: TableName<any>[], subscriber: () => void): Unsubscribe {
+  experimentalSubscribe(
+    tables: TableName<any>[],
+    subscriber: () => void,
+    debugInfo?: any,
+  ): Unsubscribe {
     if (!tables.length) {
       return noop
     }
 
-    const subscriberEntry = [tables, subscriber]
-    this._subscribers.push(subscriberEntry)
+    const entry = [tables, subscriber, debugInfo]
+    this._subscribers.push(entry)
 
     return () => {
-      const idx = this._subscribers.indexOf(subscriberEntry)
+      const idx = this._subscribers.indexOf(entry)
       idx !== -1 && this._subscribers.splice(idx, 1)
     }
   }
 
   _resetCount: number = 0
+
+  _isBeingReset: boolean = false
 
   // Resets database - permanently destroys ALL records stored in the database, and sets up empty database
   //
@@ -175,23 +211,69 @@ export default class Database {
     this._ensureInAction(
       `Database.unsafeResetDatabase() can only be called from inside of an Action. See docs for more details.`,
     )
-    // Doing this in very specific order:
-    // First kill actions, to ensure no more traffic to adapter happens
-    // then clear the database
-    // and only then clear caches, since might have had queued fetches from DB still bringing in items to cache
-    this._actionQueue._abortPendingActions()
-    await this.adapter.unsafeResetDatabase()
-    this._unsafeClearCaches()
-    this._resetCount += 1
+    try {
+      this._isBeingReset = true
+      // First kill actions, to ensure no more traffic to adapter happens
+      this._actionQueue._abortPendingActions()
+
+      // Kill ability to call adapter methods during reset (to catch bugs if someone does this)
+      const { adapter } = this
+      const ErrorAdapter = require('../adapters/error').default
+      this.adapter = (new ErrorAdapter(): any)
+
+      // Check for illegal subscribers
+      if (this._subscribers.length) {
+        // TODO: This should be an error, not a console.log, but actually useful diagnostics are necessary for this to work, otherwise people will be confused
+        // eslint-disable-next-line no-console
+        console.log(
+          `Application error! Unexpected ${this._subscribers.length} Database subscribers were detected during database.unsafeResetDatabase() call. App should not hold onto subscriptions or Watermelon objects while resetting database.`,
+        )
+        // eslint-disable-next-line no-console
+        console.log(this._subscribers)
+        this._subscribers = []
+      }
+
+      // Clear the database
+      await adapter.unsafeResetDatabase()
+
+      // Only now clear caches, since there may have been queued fetches from DB still bringing in items to cache
+      this._unsafeClearCaches()
+
+      // Restore working Database
+      this._resetCount += 1
+      this.adapter = adapter
+    } finally {
+      this._isBeingReset = false
+    }
   }
 
   _unsafeClearCaches(): void {
-    values(this.collections.map).forEach(collection => {
+    Object.values(this.collections.map).forEach(collection => {
+      // $FlowFixMe
       collection.unsafeClearCache()
     })
   }
 
   _ensureInAction(error: string): void {
     this._actionsEnabled && invariant(this._actionQueue.isRunning, error)
+  }
+
+  // (experimental) puts Database in a broken state
+  // TODO: Not used anywhere yet
+  _fatalError(error: Error): void {
+    if (!experimentalAllowsFatalError) {
+      logger.warn('Database is now broken, but experimentalAllowsFatalError has not been enabled to do anything about it...')
+      return
+    }
+
+    this._isBroken = true
+    logger.error('Database is broken. App must be reloaded before continuing.')
+
+    // TODO: Passing this to an adapter feels wrong, but it's tricky.
+    // $FlowFixMe
+    if (this.adapter.underlyingAdapter._fatalError) {
+      // $FlowFixMe
+      this.adapter.underlyingAdapter._fatalError(error)
+    }
   }
 }
